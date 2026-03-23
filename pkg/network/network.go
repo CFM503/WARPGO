@@ -61,23 +61,6 @@ func GetNetworkStatus() *NetworkStatus {
 	return status
 }
 
-// GetCurrentIP 快速获取当前出口 IP
-func GetCurrentIP(useIPv6 bool) (string, error) {
-	var url string
-	if useIPv6 {
-		url = "https://api6.ipify.org"
-	} else {
-		url = "https://api4.ipify.org"
-	}
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return strings.TrimSpace(string(body)), nil
-}
-
 func queryIP(useIPv6 bool) *IPInfo {
 	// 用 net.Dialer 强制 IPv4 或 IPv6 —— 等价于 curl -4 / curl -6
 	var network string
@@ -208,47 +191,6 @@ func FindBestMTU(endpoint string) int {
 
 const DefaultMTU = 1280
 
-// FindBestEndpoint 从端点列表中找延迟最低的 endpoint
-func FindBestEndpoint(endpoints []string) string {
-	if len(endpoints) == 0 {
-		return "engage.cloudflareclient.com:2408"
-	}
-
-	type result struct {
-		endpoint string
-		latency  time.Duration
-	}
-
-	ch := make(chan result, len(endpoints))
-	for _, ep := range endpoints {
-		go func(ep string) {
-			host := ep
-			if idx := strings.LastIndex(ep, ":"); idx > 0 {
-				host = ep[:idx]
-			}
-			host = strings.Trim(host, "[]")
-			start := time.Now()
-			conn, err := net.DialTimeout("udp", ep, 3*time.Second)
-			if err != nil {
-				ch <- result{ep, time.Hour}
-				return
-			}
-			conn.Close()
-			_ = host
-			ch <- result{ep, time.Since(start)}
-		}(ep)
-	}
-
-	best := result{endpoints[0], time.Hour}
-	for range endpoints {
-		r := <-ch
-		if r.latency < best.latency {
-			best = r
-		}
-	}
-	return best.endpoint
-}
-
 // String 返回格式化的网络状态信息
 func (s *NetworkStatus) String() string {
 	var parts []string
@@ -272,14 +214,4 @@ func (s *NetworkStatus) String() string {
 		return "网络不可用"
 	}
 	return strings.Join(parts, "\n\t\t    ")
-}
-
-// CheckConnectivity 检测到目标主机的连接性
-func CheckConnectivity(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
 }

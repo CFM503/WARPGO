@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -11,30 +12,28 @@ import (
 func DetectSSHClientIP() string {
 	// 方法1: ss -tnp 找 sshd 的 established 连接
 	out, err := exec.Command("ss", "-tnp").Output()
-	if err != nil {
-		return ""
-	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, "sshd") && !strings.Contains(line, "dropbear") {
-			continue
-		}
-		if !strings.Contains(line, "ESTAB") {
-			continue
-		}
-		// 格式: ESTAB 0 0 10.0.0.1:22 1.2.3.4:54321
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		peer := fields[4] // 对端 ip:port
-		// 去掉端口
-		idx := strings.LastIndex(peer, ":")
-		if idx > 0 {
-			ip := peer[:idx]
-			// 过滤掉私有IP，只要公网IP
-			if !isPrivateIP(ip) {
-				return ip
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.Contains(line, "sshd") && !strings.Contains(line, "dropbear") {
+				continue
+			}
+			if !strings.Contains(line, "ESTAB") {
+				continue
+			}
+			// 格式: ESTAB 0 0 10.0.0.1:22 1.2.3.4:54321
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				continue
+			}
+			peer := fields[4] // 对端 ip:port
+			// 去掉端口
+			idx := strings.LastIndex(peer, ":")
+			if idx > 0 {
+				ip := peer[:idx]
+				// 过滤掉私有IP，只要公网IP
+				if !isPrivateIP(ip) {
+					return ip
+				}
 			}
 		}
 	}
@@ -57,6 +56,40 @@ func DetectSSHClientIP() string {
 		}
 	}
 
+	// 方法3: 从 /proc/net/tcp 中获取（适用于没有 ss 或 who 命令的情况）
+	if out3, err3 := exec.Command("cat", "/proc/net/tcp").Output(); err3 == nil {
+		// 解析 /proc/net/tcp，查找 SSH 端口（22）的连接
+		for _, line := range strings.Split(string(out3), "\n") {
+			if !strings.Contains(line, ":0016") { // 22 的十六进制是 0x0016
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			// 本地地址:端口 远程地址:端口 状态
+			remoteAddr := fields[2]
+			parts := strings.Split(remoteAddr, ":")
+			if len(parts) != 2 {
+				continue
+			}
+			// 转换十六进制 IP 为点分十进制
+			ipHex := parts[0]
+			if len(ipHex) == 8 {
+				// IPv4
+				var ipBytes [4]byte
+				for i := 0; i < 4; i++ {
+					b, _ := strconv.ParseUint(ipHex[i*2:i*2+2], 16, 8)
+					ipBytes[i] = byte(b)
+				}
+				ip := fmt.Sprintf("%d.%d.%d.%d", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3])
+				if !isPrivateIP(ip) && ip != "0.0.0.0" {
+					return ip
+				}
+			}
+		}
+	}
+
 	return ""
 }
 
@@ -74,8 +107,13 @@ func ExcludeSSHClientFromWarp(useWarpCLI bool) error {
 	}
 
 	if useWarpCLI {
-		// warp-cli 方式排除
-		return exec.Command("warp-cli", "--accept-tos", "add-excluded-route", cidr).Run()
+		// 尝试新命令 tunnel ip add，如果失败则使用旧命令
+		cmd := exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "add", cidr)
+		if err := cmd.Run(); err != nil {
+			// 旧版本使用 add-excluded-route
+			exec.Command("warp-cli", "--accept-tos", "add-excluded-route", cidr).Run()
+		}
+		return nil
 	}
 
 	// ip rule 方式（WireGuard 全局模式用）
@@ -85,41 +123,6 @@ func ExcludeSSHClientFromWarp(useWarpCLI bool) error {
 		exec.Command("ip", "-4", "rule", "add", "to", cidr, "lookup", "main").Run()
 	}
 	return nil
-}
-
-// GetSSHPorts 获取当前 SSH 监听端口列表
-func GetSSHPorts() []string {
-	out, err := exec.Command("ss", "-tlpn").Output()
-	if err != nil {
-		return []string{"22"}
-	}
-
-	portSet := make(map[string]bool)
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, "sshd") && !strings.Contains(line, "dropbear") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		addr := fields[3]
-		idx := strings.LastIndex(addr, ":")
-		if idx >= 0 {
-			port := addr[idx+1:]
-			portSet[port] = true
-		}
-	}
-
-	if len(portSet) == 0 {
-		return []string{"22"}
-	}
-
-	var ports []string
-	for p := range portSet {
-		ports = append(ports, p)
-	}
-	return ports
 }
 
 // isPrivateIP 判断是否为私有 IP
@@ -140,16 +143,62 @@ func isPrivateIP(ip string) bool {
 }
 
 // AddDefaultExcludedRoutes 添加默认排除路由（保护 SSH 和 LAN）
-// 适用于 warp-cli 模式
+// 适用于 warp-cli 模式；应在 warp-cli connect 之前调用（与 split tunnel 一致）
 func AddDefaultExcludedRoutes() {
 	privateRanges := []string{
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 	}
-	for _, cidr := range privateRanges {
-		exec.Command("warp-cli", "--accept-tos", "add-excluded-route", cidr).Run()
+
+	// 尝试新命令 tunnel ip add，如果失败则使用旧命令 add-excluded-route
+	tryNewCommand := func(cidr string) {
+		// 先尝试新命令格式 (2025+ 版本)
+		cmd := exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "add", cidr)
+		if err := cmd.Run(); err != nil {
+			// 旧版本使用 add-excluded-route
+			exec.Command("warp-cli", "--accept-tos", "add-excluded-route", cidr).Run()
+		}
 	}
+
+	for _, cidr := range privateRanges {
+		tryNewCommand(cidr)
+	}
+
 	// 排除 SSH 客户端公网 IP
 	ExcludeSSHClientFromWarp(true)
+}
+
+// ApplyWarpCLIInboundProtection 在 warp-cli connect 之后调用，与 WireGuard 全局模式的
+// GlobalUpScript 对齐：用 connect 之前检测到的 LAN 地址做策略路由，避免回包走错隧道导致 SSH 断开。
+func ApplyWarpCLIInboundProtection(lan4, lan6 string) {
+	if lan4 != "" {
+		exec.Command("ip", "-4", "rule", "add", "from", lan4, "lookup", "main").Run()
+	}
+	if lan6 != "" {
+		exec.Command("ip", "-6", "rule", "add", "from", lan6, "lookup", "main").Run()
+	}
+	// 保留网段与链路本地：从该源发出的流量走主表（与 pkg/wireguard/config.go GlobalUpScript 一致）
+	exec.Command("ip", "-4", "rule", "add", "from", "172.16.0.0/12", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "add", "from", "192.168.0.0/16", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "add", "from", "10.0.0.0/8", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "add", "from", "172.17.0.0/24", "lookup", "main").Run()
+	exec.Command("ip", "-6", "rule", "add", "from", "fe80::/10", "lookup", "main").Run()
+	exec.Command("sysctl", "-q", "net.ipv4.conf.all.src_valid_mark=1").Run()
+}
+
+// RemoveWarpCLIInboundProtection 删除 ApplyWarpCLIInboundProtection 添加的策略路由。
+// lan4/lan6 为可选；若断开前后检测不一致可各调用一次以尽量清理干净。
+func RemoveWarpCLIInboundProtection(lan4, lan6 string) {
+	if lan4 != "" {
+		exec.Command("ip", "-4", "rule", "del", "from", lan4, "lookup", "main").Run()
+	}
+	if lan6 != "" {
+		exec.Command("ip", "-6", "rule", "del", "from", lan6, "lookup", "main").Run()
+	}
+	exec.Command("ip", "-4", "rule", "del", "from", "172.16.0.0/12", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "del", "from", "192.168.0.0/16", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "del", "from", "10.0.0.0/8", "lookup", "main").Run()
+	exec.Command("ip", "-4", "rule", "del", "from", "172.17.0.0/24", "lookup", "main").Run()
+	exec.Command("ip", "-6", "rule", "del", "from", "fe80::/10", "lookup", "main").Run()
 }
 
 // PrintSSHProtectionInfo 打印 SSH 保护信息

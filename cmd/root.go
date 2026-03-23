@@ -11,17 +11,15 @@ import (
 	"github.com/pzeus/warpgo/pkg/system"
 	"github.com/pzeus/warpgo/pkg/ui"
 	"github.com/pzeus/warpgo/pkg/wireguard"
-	"github.com/pzeus/warpgo/pkg/wireproxy"
 	"github.com/pzeus/warpgo/pkg/zerotrust"
 )
 
 // Execute 也是程序的入口，解析参数或启动交互菜单
 func Execute() {
 	var (
-		optInstallV4  bool
-		optInstallV6  bool
+		optInstallV4   bool
+		optInstallV6   bool
 		optInstallDual bool
-		optInstallProxy bool
 		optZeroTrust   bool
 		optUninstall   bool
 		optVersion     bool
@@ -30,7 +28,6 @@ func Execute() {
 	flag.BoolVar(&optInstallV4, "4", false, "安装 IPv4 WARP")
 	flag.BoolVar(&optInstallV6, "6", false, "安装 IPv6 WARP")
 	flag.BoolVar(&optInstallDual, "d", false, "安装双栈 WARP")
-	flag.BoolVar(&optInstallProxy, "p", false, "安装 WireProxy SOCKS5 代理")
 	flag.BoolVar(&optZeroTrust, "z", false, "配置 Zero Trust")
 	flag.BoolVar(&optUninstall, "u", false, "卸载所有 WARP 组件")
 	flag.BoolVar(&optVersion, "v", false, "显示版本")
@@ -70,11 +67,6 @@ func Execute() {
 		install.Install(sysInfo, opts)
 		return
 	}
-	if optInstallProxy {
-		opts.Mode = config.ModeWireProxy
-		install.Install(sysInfo, opts)
-		return
-	}
 	if optZeroTrust {
 		opts.Mode = config.ModeZeroTrust
 		install.Install(sysInfo, opts)
@@ -99,7 +91,6 @@ func showMainMenu(sysInfo *system.SysInfo) {
 		var items []ui.MenuItem
 
 		wgInstalled := wireguard.IsInstalled()
-		wpInstalled := wireproxy.IsInstalled()
 		ztInstalled := zerotrust.IsWarpCLIInstalled()
 
 		if ztInstalled {
@@ -112,7 +103,7 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				mode = "非全局"
 			}
 			ui.PrintKV("WARP 模式", mode)
-			
+
 			stack := wireguard.GetCurrentStack()
 			stackStr := "双栈"
 			if stack == config.StackIPv4 {
@@ -121,15 +112,12 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				stackStr = "IPv6"
 			}
 			ui.PrintKV("WARP 协议栈", stackStr)
-		} else if wpInstalled {
-			ui.PrintStatus("WireProxy 服务", wireproxy.IsRunning())
 		}
 
-		if !wgInstalled && !wpInstalled && !ztInstalled {
+		if !wgInstalled && !ztInstalled {
 			items = append(items,
 				ui.MenuItem{Key: "1", Label: "安装 WARP", Description: "使用 WireGuard 内核运行，接管全局或部分网络"},
-				ui.MenuItem{Key: "2", Label: "安装 WireProxy", Description: "本地 SOCKS5 代理，不修改系统路由表 (推荐)"},
-				ui.MenuItem{Key: "3", Label: "配置 Zero Trust", Description: "使用 Cloudflare Teams 组织网络"},
+				ui.MenuItem{Key: "2", Label: "配置 Zero Trust", Description: "使用 Cloudflare Teams 组织网络，透明代理"},
 			)
 		} else if wgInstalled {
 			items = append(items,
@@ -137,17 +125,13 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				ui.MenuItem{Key: "2", Label: "切换全局/非全局模式", Description: "是否接管所有流量"},
 				ui.MenuItem{Key: "3", Label: "切换 IPv4/IPv6/双栈", Description: "修改出口网络类型"},
 			)
-		} else if wpInstalled {
-			items = append(items,
-				ui.MenuItem{Key: "1", Label: "启停 WireProxy", Description: "开关 SOCKS5 服务"},
-			)
 		} else if ztInstalled {
 			items = append(items,
 				ui.MenuItem{Key: "1", Label: "连接/断开 Zero Trust", Description: "控制 warp-cli 连接状态"},
 			)
 		}
 
-		if wgInstalled || wpInstalled || ztInstalled {
+		if wgInstalled || ztInstalled {
 			items = append(items, ui.MenuItem{Key: "u", Label: "完全卸载", Description: "清理所有已安装的组件和配置"})
 		}
 
@@ -158,13 +142,11 @@ func showMainMenu(sysInfo *system.SysInfo) {
 
 		switch choice {
 		case "1":
-			if !wgInstalled && !wpInstalled && !ztInstalled {
+			if !wgInstalled && !ztInstalled {
 				// 安装 WARP 菜单
 				installWarpMenu(sysInfo)
 			} else if wgInstalled {
 				wireguard.Toggle()
-			} else if wpInstalled {
-				wireproxy.Toggle()
 			} else if ztInstalled {
 				st, _ := zerotrust.GetStatus()
 				if st.Connected {
@@ -174,19 +156,7 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				}
 			}
 		case "2":
-			if !wgInstalled && !wpInstalled && !ztInstalled {
-				// 安装 WireProxy
-				opts := &install.InstallOptions{
-					Mode: config.ModeWireProxy,
-					Port: install.InputPort(config.DefaultWireproxyPort),
-				}
-				install.Install(sysInfo, opts)
-			} else if wgInstalled {
-				global := wireguard.IsGlobalMode()
-				wireguard.SwitchGlobalMode(!global)
-			}
-		case "3":
-			if !wgInstalled && !wpInstalled && !ztInstalled {
+			if !wgInstalled && !ztInstalled {
 				// Zero Trust（Service Token 方式）
 				ui.Info("Zero Trust 接入需要 Service Token（从 Cloudflare 控制台获取）")
 				ui.Hint("获取路径: one.dash.cloudflare.com → Settings → WARP Client → Device enrollment")
@@ -203,18 +173,20 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				if clientSecret == "" {
 					continue
 				}
-				proxyReq := ui.Confirm("是否使用代理模式 (SOCKS5) 以保护 SSH?")
 				opts := &install.InstallOptions{
 					Mode:                  config.ModeZeroTrust,
 					ZeroTrustOrg:          org,
 					ZeroTrustEnrollMode:   config.EnrollServiceToken,
 					ZeroTrustClientID:     clientID,
 					ZeroTrustClientSecret: clientSecret,
-					ZeroTrustProxy:        proxyReq,
 				}
 				install.Install(sysInfo, opts)
-
 			} else if wgInstalled {
+				global := wireguard.IsGlobalMode()
+				wireguard.SwitchGlobalMode(!global)
+			}
+		case "3":
+			if wgInstalled {
 				stackMenu()
 			}
 		case "u", "U":

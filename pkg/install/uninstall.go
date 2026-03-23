@@ -10,6 +10,7 @@ import (
 	"github.com/pzeus/warpgo/pkg/system"
 	"github.com/pzeus/warpgo/pkg/ui"
 	"github.com/pzeus/warpgo/pkg/warp"
+	"github.com/pzeus/warpgo/pkg/zerotrust"
 )
 
 // UninstallResult 卸载结果摘要
@@ -23,45 +24,56 @@ type UninstallResult struct {
 // 无论在主菜单哪个状态下触发，都执行同一套完整流程。
 func Uninstall() (UninstallResult, error) {
 	result := UninstallResult{}
+	sysInfo, _ := system.Detect()
 
 	ui.Separator()
 	ui.Header("开始完全卸载 — 将清理所有 WarpGo 相关内容")
 	ui.Separator()
 
 	// ── 第一步：停止所有服务 ──────────────────────────────────────────────
-	ui.Info("步骤 1/5  停止所有运行中的服务...")
+	ui.Info("步骤 1/6  停止所有运行中的服务...")
 	stopAllServices()
 
-	// ── 第二步：注销 API 账户 ─────────────────────────────────────────────
-	ui.Info("步骤 2/5  注销 Cloudflare WARP 账户...")
+	// ── 第二步：清理透明代理规则 ──────────────────────────────────────────
+	ui.Info("步骤 2/6  清除透明代理规则...")
+	zerotrust.RemoveTransparentProxy()
+	zerotrust.StopRedsocks()
+
+	// ── 第三步：注销 API 账户 ─────────────────────────────────────────────
+	ui.Info("步骤 3/6  注销 Cloudflare WARP 账户...")
 	cancelWarpAccount()
 
-	// ── 第三步：卸载系统包 ────────────────────────────────────────────────
-	ui.Info("步骤 3/5  卸载系统包 (wireguard-tools, cloudflare-warp)...")
+	// ── 第四步：卸载系统包 ────────────────────────────────────────────────
+	ui.Info("步骤 4/6  卸载系统包 (wireguard-tools, cloudflare-warp, redsocks)...")
 	result.WireGuardRemoved = removePackages()
 	result.ZeroTrustRemoved = removeZeroTrustPackage()
+	if sysInfo != nil {
+		zerotrust.UninstallRedsocks(sysInfo)
+	}
 
-	// ── 第四步：清理网络规则 ──────────────────────────────────────────────
-	ui.Info("步骤 4/5  清除路由规则、防火墙规则、DNS 配置...")
+	// ── 第五步：清理网络规则 ──────────────────────────────────────────────
+	ui.Info("步骤 5/6  清除路由规则、防火墙规则、DNS 配置...")
 	cleanupNetworkRules()
+	cleanupProxyEnvVars()
 
-	// ── 第五步：删除所有文件 ──────────────────────────────────────────────
-	ui.Info("步骤 5/5  删除所有配置文件和二进制文件...")
+	// ── 第六步：删除所有文件 ──────────────────────────────────────────────
+	ui.Info("步骤 6/6  删除所有配置文件和二进制文件...")
 	removeAllFiles()
 	result.WireProxyRemoved = true
 
 	ui.Separator()
 	ui.Info("✓ 完全卸载完成！服务器网络和端口已完全恢复原状。")
+	ui.Info("请重新登录或运行 'source ~/.bashrc' 使环境变量更改生效。")
 	return result, nil
 }
 
 // stopAllServices 停止所有相关服务和网络接口
 func stopAllServices() {
 	cmds := [][]string{
+		// 停止 redsocks 透明代理
+		{"systemctl", "disable", "--now", "redsocks"},
 		// 停止 WireGuard WARP 接口
 		{"wg-quick", "down", config.WarpIfName},
-		// 停止 WireProxy 服务
-		{"systemctl", "disable", "--now", "wireproxy"},
 		// 停止 Zero Trust / warp-cli 守护进程
 		{"warp-cli", "--accept-tos", "disconnect"},
 		{"warp-cli", "--accept-tos", "registration", "delete"},
@@ -212,9 +224,10 @@ func cleanupNetworkRules() {
 func removeAllFiles() {
 	// /etc/wireguard/ 下的所有 warp 相关文件
 	wireguardFiles := []string{
-		config.WarpConfPath,            // warp.conf
-		config.WarpAccountPath,         // warp-account.conf
-		config.ZeroTrustConfigPath,     // zerotrust.conf
+		config.WarpConfPath,               // warp.conf
+		config.WarpAccountPath,            // warp-account.conf
+		config.ZeroTrustConfigPath,        // zerotrust.conf
+		config.TransparentProxyConfigPath, // transparent-proxy.conf
 		config.ScriptDir + "/NonGlobalUp.sh",
 		config.ScriptDir + "/NonGlobalDown.sh",
 		config.ScriptDir + "/GlobalUp.sh",
@@ -234,7 +247,6 @@ func removeAllFiles() {
 	// 二进制文件
 	binaries := []string{
 		config.WireguardGoPath, // /usr/bin/wireguard-go
-		config.WireproxyPath,   // /usr/bin/wireproxy
 		config.WarpBinPath,     // /usr/bin/warp
 	}
 	for _, b := range binaries {
@@ -243,8 +255,8 @@ func removeAllFiles() {
 
 	// systemd 服务单元
 	serviceFiles := []string{
-		"/lib/systemd/system/wireproxy.service",
-		"/etc/systemd/system/wireproxy.service",
+		"/lib/systemd/system/redsocks.service",
+		"/etc/redsocks.conf",
 	}
 	for _, s := range serviceFiles {
 		os.Remove(s)
@@ -255,7 +267,6 @@ func removeAllFiles() {
 		"/tmp/best_mtu",
 		"/tmp/wireguard-go-20230223",
 		"/tmp/wireguard-go-20201118",
-		"/tmp/wireproxy.tar.gz",
 	}
 	for _, t := range tmpFiles {
 		os.Remove(t)
@@ -277,4 +288,83 @@ func removeAllFiles() {
 	}
 
 	fmt.Println() // 视觉间隔
+}
+
+// cleanupProxyEnvVars 清理可能由 WarpGo 设置的代理环境变量
+// 这些环境变量可能在用户的 shell 配置文件中设置
+func cleanupProxyEnvVars() {
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		return
+	}
+
+	// 需要清理的配置文件列表
+	configFiles := []string{
+		homeDir + "/.bashrc",
+		homeDir + "/.bash_profile",
+		homeDir + "/.profile",
+		homeDir + "/.zshrc",
+		homeDir + "/.config/fish/config.fish",
+	}
+
+	// 代理环境变量模式
+	proxyPatterns := []string{
+		"http_proxy",
+		"https_proxy",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"all_proxy",
+		"ALL_PROXY",
+	}
+
+	for _, configFile := range configFiles {
+		if _, err := os.Stat(configFile); err != nil {
+			continue
+		}
+
+		// 读取文件内容
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			continue
+		}
+
+		content := string(data)
+		modified := false
+
+		// 移除包含代理设置的行
+		lines := strings.Split(content, "\n")
+		var cleanLines []string
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			shouldRemove := false
+
+			// 检查是否包含代理环境变量设置
+			for _, pattern := range proxyPatterns {
+				if strings.HasPrefix(trimmed, pattern+"=") ||
+					strings.HasPrefix(trimmed, "export "+pattern+"=") {
+					shouldRemove = true
+					modified = true
+					break
+				}
+			}
+
+			if !shouldRemove {
+				cleanLines = append(cleanLines, line)
+			}
+		}
+
+		// 如果有修改，写回文件
+		if modified {
+			newContent := strings.Join(cleanLines, "\n")
+			if err := os.WriteFile(configFile, []byte(newContent), 0644); err == nil {
+				ui.Info(fmt.Sprintf("已清理配置文件: %s", configFile))
+			}
+		}
+	}
+
+	// 提醒用户当前 shell 会话可能仍受影响
+	ui.Warning("提示：当前 shell 会话中的代理环境变量需要手动清除")
+	ui.Info("运行以下命令清除当前会话的代理设置:")
+	ui.Info("  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY")
 }

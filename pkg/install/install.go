@@ -3,8 +3,6 @@ package install
 import (
 	"fmt"
 	"net"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/pzeus/warpgo/config"
@@ -13,7 +11,6 @@ import (
 	"github.com/pzeus/warpgo/pkg/ui"
 	"github.com/pzeus/warpgo/pkg/warp"
 	"github.com/pzeus/warpgo/pkg/wireguard"
-	"github.com/pzeus/warpgo/pkg/wireproxy"
 	"github.com/pzeus/warpgo/pkg/zerotrust"
 )
 
@@ -27,7 +24,7 @@ type InstallOptions struct {
 	GHProxy    string
 	// Zero Trust
 	ZeroTrustOrg          string
-	ZeroTrustProxy        bool                      // Zero Trust 使用代理模式
+	ZeroTrustProxy        bool                       // Zero Trust 使用代理模式
 	ZeroTrustEnrollMode   config.ZeroTrustEnrollMode // 接入方式
 	ZeroTrustClientID     string                     // Service Token Client ID
 	ZeroTrustClientSecret string                     // Service Token Client Secret
@@ -38,8 +35,6 @@ func Install(sysInfo *system.SysInfo, opts *InstallOptions) error {
 	switch opts.Mode {
 	case config.ModeWireGuardV4, config.ModeWireGuardV6, config.ModeWireGuardDual:
 		return installWireGuard(sysInfo, opts)
-	case config.ModeWireProxy:
-		return installWireProxy(sysInfo, opts)
 	case config.ModeZeroTrust:
 		return installZeroTrust(sysInfo, opts)
 	default:
@@ -112,67 +107,6 @@ func installWireGuard(sysInfo *system.SysInfo, opts *InstallOptions) error {
 	return nil
 }
 
-// installWireProxy 安装 WireProxy SOCKS5 方案
-func installWireProxy(sysInfo *system.SysInfo, opts *InstallOptions) error {
-	// 检查端口
-	port := opts.Port
-	if port == 0 {
-		port = config.DefaultWireproxyPort
-	}
-	port = findFreePort(port)
-
-	// 1. 注册 WARP 账户
-	ui.Info("正在注册 WARP 账户...")
-	acc, err := warp.Register()
-	if err != nil {
-		return fmt.Errorf("注册 WARP 账户失败: %v", err)
-	}
-
-	// 2. 保存账户
-	acc.SaveToFile(config.WarpAccountPath)
-
-	// 3. 下载 wireproxy
-	ui.Info("正在下载 WireProxy...")
-	if err := wireproxy.Install(sysInfo.Arch, opts.GHProxy); err != nil {
-		return fmt.Errorf("下载 WireProxy 失败: %v", err)
-	}
-
-	// 4. 检测 MTU 和 Endpoint
-	mtu := detectMTU(opts.Endpoint)
-	if opts.Endpoint == "" {
-		opts.Endpoint = acc.GetEndpoint(false)
-	}
-
-	// 5. 生成配置
-	wpCfg := &wireproxy.WireproxyConfig{
-		Account:  acc,
-		Port:     port,
-		MTU:      mtu,
-		Endpoint: opts.Endpoint,
-	}
-	confContent := wireproxy.GenerateConfig(wpCfg)
-
-	// 6. 写入配置
-	if err := wireproxy.WriteConfig(confContent); err != nil {
-		return fmt.Errorf("写入 wireproxy 配置失败: %v", err)
-	}
-
-	// 7. 创建 systemd 服务
-	if err := wireproxy.CreateSystemdService(); err != nil {
-		return fmt.Errorf("创建 systemd 服务失败: %v", err)
-	}
-
-	// 8. 启动
-	if err := wireproxy.Start(); err != nil {
-		return fmt.Errorf("启动 wireproxy 失败: %v", err)
-	}
-	wireproxy.Enable()
-
-	ui.Info(fmt.Sprintf("✓ WireProxy 安装完成！SOCKS5 代理: 127.0.0.1:%d", port))
-	showNetworkResult()
-	return nil
-}
-
 // installZeroTrust 安装 Cloudflare Zero Trust
 func installZeroTrust(sysInfo *system.SysInfo, opts *InstallOptions) error {
 	// 1. 安装 warp-cli
@@ -183,34 +117,42 @@ func installZeroTrust(sysInfo *system.SysInfo, opts *InstallOptions) error {
 		}
 	}
 
-	// 2. 注册（Service Token 方式）
+	// 2. 确定 SOCKS5 端口
+	socksPort := config.DefaultSocks5Port
+
+	// 3. 默认使用代理模式（非全局）
+	useProxyMode := true
+
+	// 4. 注册（Service Token 方式，代理模式通过 MDM 配置）
 	ui.Info("使用 Service Token 方式加入 Zero Trust...")
-	if err := zerotrust.EnrollServiceToken(opts.ZeroTrustOrg, opts.ZeroTrustClientID, opts.ZeroTrustClientSecret); err != nil {
+	if err := zerotrust.EnrollServiceToken(opts.ZeroTrustOrg, opts.ZeroTrustClientID, opts.ZeroTrustClientSecret, useProxyMode, socksPort); err != nil {
 		return fmt.Errorf("Zero Trust 注册失败: %v", err)
 	}
 
-	// 3. 设置运行模式（代理或标准 WARP）
-	port := opts.Port
-	if port == 0 {
-		port = 40001
-	}
-	if opts.ZeroTrustProxy {
-		if err := zerotrust.SetProxyMode(port); err != nil {
-			ui.Warning("设置代理模式失败，将使用标准 WARP 模式")
-		} else {
-			ui.Info(fmt.Sprintf("已设置代理模式，SOCKS5: 127.0.0.1:%d", port))
-		}
-	} else {
-		zerotrust.SetWarpMode("warp")
-	}
+	ui.Info(fmt.Sprintf("代理模式已配置，SOCKS5: 127.0.0.1:%d", socksPort))
 
-	// 4. 连接
+	// 5. 连接
 	ui.Info("正在连接 Zero Trust...")
 	if err := zerotrust.Connect(); err != nil {
 		return fmt.Errorf("连接 Zero Trust 失败: %v", err)
 	}
 
-	// 5. 保存配置
+	// 6. 安装 redsocks 透明代理
+	ui.Info("正在配置透明代理，使 VPS 所有出站流量通过 WARP...")
+	if err := zerotrust.InstallRedsocks(sysInfo, socksPort); err != nil {
+		ui.Warning(fmt.Sprintf("安装 redsocks 失败: %v", err))
+		ui.Warning("代理模式仍然可用，但透明代理未配置")
+	}
+
+	// 7. 配置 iptables 透明代理规则
+	if err := zerotrust.SetupTransparentProxy(); err != nil {
+		ui.Warning(fmt.Sprintf("配置透明代理规则失败: %v", err))
+	}
+
+	// 8. 保存透明代理配置状态
+	zerotrust.SaveTransparentProxyConfig(true)
+
+	// 9. 保存配置
 	ztCfg := &zerotrust.ZeroTrustConfig{
 		OrgName:      opts.ZeroTrustOrg,
 		ClientID:     opts.ZeroTrustClientID,
@@ -219,6 +161,10 @@ func installZeroTrust(sysInfo *system.SysInfo, opts *InstallOptions) error {
 	zerotrust.WriteZeroTrustConfig(ztCfg)
 
 	ui.Info("✓ Cloudflare Zero Trust 安装完成！")
+	ui.Info("")
+	ui.Info("出站流量: VPS → redsocks → SOCKS5(127.0.0.1:40001) → WARP → 互联网")
+	ui.Info("入站流量: SSH、Web 等端口正常访问，不受影响")
+	ui.Info("")
 	showNetworkResult()
 	return nil
 }
@@ -302,38 +248,4 @@ func showNetworkResult() {
 	ui.Warning("网络检测超时，请手动检查:")
 	ui.Hint("  curl https://www.cloudflare.com/cdn-cgi/trace")
 	ui.Hint("  wg show warp")
-}
-
-// CheckDependencies 检查依赖
-func CheckDependencies(sysInfo *system.SysInfo) error {
-	required := []string{"curl", "wget"}
-	missing := []string{}
-	for _, dep := range required {
-		if !system.CheckBinaryExists(dep) {
-			missing = append(missing, dep)
-		}
-	}
-	if len(missing) > 0 {
-		ui.Warning(fmt.Sprintf("正在安装缺少的依赖: %s", strings.Join(missing, ", ")))
-		if err := system.InstallPackages(sysInfo.PkgManager, missing...); err != nil {
-			return fmt.Errorf("安装依赖失败: %v", err)
-		}
-	}
-	return nil
-}
-
-// InputPort 交互式输入端口
-func InputPort(defaultPort int) int {
-	for {
-		input := ui.ReadInput(fmt.Sprintf("请输入 SOCKS5 端口 (默认 %d): ", defaultPort))
-		if input == "" {
-			return findFreePort(defaultPort)
-		}
-		port, err := strconv.Atoi(input)
-		if err != nil || port < 1024 || port > 65535 {
-			ui.Warning("请输入 1024-65535 之间的端口号")
-			continue
-		}
-		return findFreePort(port)
-	}
 }
