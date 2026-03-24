@@ -95,7 +95,34 @@ MDM 参数说明（官方）：
   -u    卸载
 
 --------------------------------------------------------------------------------
-五、后续改代码时可对照的检查点
+五、验证接入状态
+--------------------------------------------------------------------------------
+
+  验证是 WARP 还是 Zero Trust 接入：
+    warp-cli --accept-tos registration show
+
+  输出示例：
+    - Zero Trust: 显示 Organization（组织名称）
+    - 免费 WARP: 无 Organization 字段
+
+  其他验证命令：
+    # 检查连接状态
+    warp-cli --accept-tos status
+
+    # 检查出口 IP（应为 Cloudflare IP）
+    curl -4 ip.gs
+
+    # 检查 WARP Trace
+    curl -s https://www.cloudflare.com/cdn-cgi/trace | grep warp
+
+    # 检查代理端口
+    ss -tlnp | grep 40001
+
+    # 检查 redsocks 服务
+    systemctl status redsocks
+
+--------------------------------------------------------------------------------
+六、后续改代码时可对照的检查点
 --------------------------------------------------------------------------------
 
   - Service Token 与 mdm.xml 字段是否与官方 MDM 参数一致
