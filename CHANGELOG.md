@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.4] - 2026-03-24
+
+### 错误处理修复
+- **18处函数调用添加错误检查**：
+  - `install.Install()` - 6处
+  - `install.Uninstall()` - 2处
+  - `wireguard.Toggle()` - 1处
+  - `wireguard.SwitchGlobalMode()` - 1处
+  - `wireguard.SwitchStack()` - 3处
+  - `zerotrust.Connect()` - 1处
+  - `zerotrust.Disconnect()` - 1处
+
+### 改进
+- 统一错误处理格式
+- 命令行模式使用 `ui.Error()` 终止程序
+- 菜单模式使用 `ui.Warning()` 继续运行
+
+---
+
 ## [1.2.1] - 2026-03-24
 
 ### 网络状态显示优化

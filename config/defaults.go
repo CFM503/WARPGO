@@ -1,7 +1,7 @@
 package config
 
 const (
-	Version = "1.2.3"
+	Version = "1.2.4"
 
 	// Cloudflare WARP API
 	WarpAPIBase     = "https://api.cloudflareclient.com/v0a2158"

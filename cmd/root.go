@@ -54,26 +54,36 @@ func Execute() {
 	// 命令行快捷方式
 	if optInstallV4 {
 		opts.Mode = config.ModeWireGuardV4
-		install.Install(sysInfo, opts)
+		if err := install.Install(sysInfo, opts); err != nil {
+			ui.Error(fmt.Sprintf("安装失败: %v", err))
+		}
 		return
 	}
 	if optInstallV6 {
 		opts.Mode = config.ModeWireGuardV6
-		install.Install(sysInfo, opts)
+		if err := install.Install(sysInfo, opts); err != nil {
+			ui.Error(fmt.Sprintf("安装失败: %v", err))
+		}
 		return
 	}
 	if optInstallDual {
 		opts.Mode = config.ModeWireGuardDual
-		install.Install(sysInfo, opts)
+		if err := install.Install(sysInfo, opts); err != nil {
+			ui.Error(fmt.Sprintf("安装失败: %v", err))
+		}
 		return
 	}
 	if optZeroTrust {
 		opts.Mode = config.ModeZeroTrust
-		install.Install(sysInfo, opts)
+		if err := install.Install(sysInfo, opts); err != nil {
+			ui.Error(fmt.Sprintf("安装失败: %v", err))
+		}
 		return
 	}
 	if optUninstall {
-		install.Uninstall()
+		if _, err := install.Uninstall(); err != nil {
+			ui.Error(fmt.Sprintf("卸载失败: %v", err))
+		}
 		return
 	}
 
@@ -198,13 +208,19 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				// 安装 WARP 菜单
 				installWarpMenu(sysInfo)
 			} else if wgInstalled {
-				wireguard.Toggle()
+				if err := wireguard.Toggle(); err != nil {
+					ui.Warning(fmt.Sprintf("操作失败: %v", err))
+				}
 			} else if ztInstalled {
 				st, _ := zerotrust.GetStatus()
 				if st.Connected {
-					zerotrust.Disconnect()
+					if err := zerotrust.Disconnect(); err != nil {
+						ui.Warning(fmt.Sprintf("断开连接失败: %v", err))
+					}
 				} else {
-					zerotrust.Connect()
+					if err := zerotrust.Connect(); err != nil {
+						ui.Warning(fmt.Sprintf("连接失败: %v", err))
+					}
 				}
 			}
 		case "2":
@@ -213,7 +229,9 @@ func showMainMenu(sysInfo *system.SysInfo) {
 				installZeroTrustMenu(sysInfo)
 			} else if wgInstalled {
 				global := wireguard.IsGlobalMode()
-				wireguard.SwitchGlobalMode(!global)
+				if err := wireguard.SwitchGlobalMode(!global); err != nil {
+					ui.Warning(fmt.Sprintf("切换模式失败: %v", err))
+				}
 			}
 		case "3":
 			if wgInstalled {
@@ -228,7 +246,9 @@ func showMainMenu(sysInfo *system.SysInfo) {
 			showHelp()
 		case "u", "U":
 			if ui.Confirm("确定要完全卸载所有 WARP 相关组件吗？") {
-				install.Uninstall()
+				if _, err := install.Uninstall(); err != nil {
+					ui.Warning(fmt.Sprintf("卸载失败: %v", err))
+				}
 			}
 		case "0":
 			ui.Info("感谢使用 WarpGo！再见！")
@@ -278,7 +298,9 @@ func installWarpMenu(sysInfo *system.SysInfo) {
 
 	globalReq := ui.Confirm("是否使用全局模式？(推荐选 y，所有流量走 WARP，SSH 不受影响)")
 	opts.GlobalMode = globalReq
-	install.Install(sysInfo, opts)
+	if err := install.Install(sysInfo, opts); err != nil {
+		ui.Warning(fmt.Sprintf("安装失败: %v", err))
+	}
 }
 
 func stackMenu() {
@@ -292,11 +314,17 @@ func stackMenu() {
 	choice := ui.ShowMenu("切换路由协议栈", items)
 	switch choice {
 	case "1":
-		wireguard.SwitchStack(config.StackIPv4)
+		if err := wireguard.SwitchStack(config.StackIPv4); err != nil {
+			ui.Warning(fmt.Sprintf("切换失败: %v", err))
+		}
 	case "2":
-		wireguard.SwitchStack(config.StackIPv6)
+		if err := wireguard.SwitchStack(config.StackIPv6); err != nil {
+			ui.Warning(fmt.Sprintf("切换失败: %v", err))
+		}
 	case "3":
-		wireguard.SwitchStack(config.StackDual)
+		if err := wireguard.SwitchStack(config.StackDual); err != nil {
+			ui.Warning(fmt.Sprintf("切换失败: %v", err))
+		}
 	}
 }
 
@@ -338,7 +366,9 @@ func installZeroTrustMenu(sysInfo *system.SysInfo) {
 			ZeroTrustClientID:     clientID,
 			ZeroTrustClientSecret: clientSecret,
 		}
-		install.Install(sysInfo, opts)
+		if err := install.Install(sysInfo, opts); err != nil {
+			ui.Warning(fmt.Sprintf("安装失败: %v", err))
+		}
 	case "0":
 		return
 	default:
