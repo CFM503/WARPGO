@@ -30,6 +30,11 @@ type NetworkStatus struct {
 	HasIPv6     bool
 	WARPTraceV4 string // off / on / plus
 	WARPTraceV6 string
+	// WARP 接口出口 IP（非全局模式下使用）
+	WARPIPv4    *IPInfo
+	WARPIPv6    *IPInfo
+	HasWARPIPv4 bool
+	HasWARPIPv6 bool
 }
 
 var httpClient = &http.Client{Timeout: 8 * time.Second}
@@ -56,6 +61,20 @@ func GetNetworkStatus() *NetworkStatus {
 	}
 	if status.HasIPv6 {
 		status.WARPTraceV6 = checkWARPTrace(true)
+	}
+
+	// 如果 WARP 接口存在，检测 WARP 接口出口 IP
+	if isWARPInterfaceExists() {
+		chW4 := make(chan *IPInfo, 1)
+		chW6 := make(chan *IPInfo, 1)
+
+		go func() { chW4 <- queryWARPInterfaceIP(false) }()
+		go func() { chW6 <- queryWARPInterfaceIP(true) }()
+
+		status.WARPIPv4 = <-chW4
+		status.WARPIPv6 = <-chW6
+		status.HasWARPIPv4 = status.WARPIPv4 != nil
+		status.HasWARPIPv6 = status.WARPIPv6 != nil
 	}
 
 	return status
@@ -127,6 +146,45 @@ func getIPWithStack(client *http.Client, useIPv6 bool) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
+// isWARPInterfaceExists 检测 WARP 接口是否存在
+func isWARPInterfaceExists() bool {
+	out, err := exec.Command("ip", "link", "show", "warp").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "warp")
+}
+
+// queryWARPInterfaceIP 通过 WARP 接口获取出口 IP
+func queryWARPInterfaceIP(useIPv6 bool) *IPInfo {
+	var url string
+	if useIPv6 {
+		url = "https://api6.ipify.org"
+	} else {
+		url = "https://api4.ipify.org"
+	}
+
+	// 使用 curl 通过 WARP 接口获取 IP
+	var cmd *exec.Cmd
+	if useIPv6 {
+		cmd = exec.Command("curl", "-6", "--interface", "warp", "-s", "--max-time", "5", url)
+	} else {
+		cmd = exec.Command("curl", "-4", "--interface", "warp", "-s", "--max-time", "5", url)
+	}
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	ip := strings.TrimSpace(string(out))
+	if ip == "" {
+		return nil
+	}
+
+	return &IPInfo{IP: ip, IsWARP: true}
+}
+
 // checkWARPTrace 通过 Cloudflare Trace 检测是否经过 WARP
 func checkWARPTrace(useIPv6 bool) string {
 	var network string
@@ -194,24 +252,90 @@ const DefaultMTU = 1280
 // String 返回格式化的网络状态信息
 func (s *NetworkStatus) String() string {
 	var parts []string
+
+	// IPv4 信息 - 固定格式对齐
 	if s.HasIPv4 && s.IPv4 != nil {
 		warpMark := ""
 		if s.WARPTraceV4 == "on" || s.WARPTraceV4 == "plus" {
 			warpMark = " [WARP]"
 		}
-		parts = append(parts, fmt.Sprintf("IPv4: %s %s %s%s",
-			s.IPv4.IP, s.IPv4.Country, s.IPv4.Org, warpMark))
+		// 格式: IPv4: <IP> <Country> <Org> [WARP]
+		parts = append(parts, fmt.Sprintf("IPv4:      %-15s %-4s %-25s%s",
+			s.IPv4.IP, s.IPv4.Country, truncateOrg(s.IPv4.Org), warpMark))
+	} else {
+		parts = append(parts, "IPv4:      无")
 	}
+
+	// IPv6 信息 - 固定格式对齐
 	if s.HasIPv6 && s.IPv6 != nil {
 		warpMark := ""
 		if s.WARPTraceV6 == "on" || s.WARPTraceV6 == "plus" {
 			warpMark = " [WARP]"
 		}
-		parts = append(parts, fmt.Sprintf("IPv6: %s %s %s%s",
-			s.IPv6.IP, s.IPv6.Country, s.IPv6.Org, warpMark))
+		// IPv6 地址截断显示
+		ip := truncateIPv6(s.IPv6.IP)
+		parts = append(parts, fmt.Sprintf("IPv6:      %-15s %-4s %-25s%s",
+			ip, s.IPv6.Country, truncateOrg(s.IPv6.Org), warpMark))
+	} else {
+		parts = append(parts, "IPv6:      无")
 	}
+
+	// WARP 接口 IPv4 信息
+	if s.HasWARPIPv4 && s.WARPIPv4 != nil {
+		parts = append(parts, fmt.Sprintf("WARP IPv4: %-15s %s", s.WARPIPv4.IP, "[WARP接口]"))
+	}
+
+	// WARP 接口 IPv6 信息
+	if s.HasWARPIPv6 && s.WARPIPv6 != nil {
+		ip := truncateIPv6(s.WARPIPv6.IP)
+		parts = append(parts, fmt.Sprintf("WARP IPv6: %-15s %s", ip, "[WARP接口]"))
+	}
+
 	if len(parts) == 0 {
 		return "网络不可用"
 	}
-	return strings.Join(parts, "\n\t\t    ")
+	return strings.Join(parts, "\n                    ")
+}
+
+// truncateIPv6 截断 IPv6 地址显示
+func truncateIPv6(ip string) string {
+	if len(ip) > 15 {
+		return ip[:15] + ".."
+	}
+	return ip
+}
+
+// truncateOrg 截断组织名称显示
+func truncateOrg(org string) string {
+	if len(org) > 25 {
+		return org[:25] + ".."
+	}
+	return org
+}
+
+// StringSimple 返回简化的网络状态信息（单行）
+func (s *NetworkStatus) StringSimple() string {
+	var parts []string
+
+	if s.HasIPv4 && s.IPv4 != nil {
+		warpMark := ""
+		if s.WARPTraceV4 == "on" || s.WARPTraceV4 == "plus" {
+			warpMark = " [WARP]"
+		}
+		parts = append(parts, fmt.Sprintf("v4:%s%s", s.IPv4.IP, warpMark))
+	} else {
+		parts = append(parts, "v4:无")
+	}
+
+	if s.HasIPv6 && s.IPv6 != nil {
+		warpMark := ""
+		if s.WARPTraceV6 == "on" || s.WARPTraceV6 == "plus" {
+			warpMark = " [WARP]"
+		}
+		parts = append(parts, fmt.Sprintf("v6:%s%s", s.IPv6.IP, warpMark))
+	} else {
+		parts = append(parts, "v6:无")
+	}
+
+	return strings.Join(parts, " | ")
 }

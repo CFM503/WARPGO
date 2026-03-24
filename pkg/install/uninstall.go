@@ -16,7 +16,6 @@ import (
 // UninstallResult 卸载结果摘要
 type UninstallResult struct {
 	WireGuardRemoved bool
-	WireProxyRemoved bool
 	ZeroTrustRemoved bool
 }
 
@@ -45,8 +44,8 @@ func Uninstall() (UninstallResult, error) {
 
 	// ── 第四步：卸载系统包 ────────────────────────────────────────────────
 	ui.Info("步骤 4/6  卸载系统包 (wireguard-tools, cloudflare-warp, redsocks)...")
-	result.WireGuardRemoved = removePackages()
-	result.ZeroTrustRemoved = removeZeroTrustPackage()
+	result.WireGuardRemoved = removePackages(sysInfo)
+	result.ZeroTrustRemoved = removeZeroTrustPackage(sysInfo)
 	if sysInfo != nil {
 		zerotrust.UninstallRedsocks(sysInfo)
 	}
@@ -59,7 +58,6 @@ func Uninstall() (UninstallResult, error) {
 	// ── 第六步：删除所有文件 ──────────────────────────────────────────────
 	ui.Info("步骤 6/6  删除所有配置文件和二进制文件...")
 	removeAllFiles()
-	result.WireProxyRemoved = true
 
 	ui.Separator()
 	ui.Info("✓ 完全卸载完成！服务器网络和端口已完全恢复原状。")
@@ -74,10 +72,13 @@ func stopAllServices() {
 		{"systemctl", "disable", "--now", "redsocks"},
 		// 停止 WireGuard WARP 接口
 		{"wg-quick", "down", config.WarpIfName},
+		{"systemctl", "stop", "wg-quick@warp"},
+		{"systemctl", "disable", "wg-quick@warp"},
 		// 停止 Zero Trust / warp-cli 守护进程
 		{"warp-cli", "--accept-tos", "disconnect"},
 		{"warp-cli", "--accept-tos", "registration", "delete"},
 		{"systemctl", "disable", "--now", "warp-svc"},
+		// 不重启 systemd-resolved，避免影响 DNS
 	}
 	for _, args := range cmds {
 		exec.Command(args[0], args[1:]...).Run() // 忽略错误，能停则停
@@ -92,9 +93,8 @@ func cancelWarpAccount() {
 }
 
 // removePackages 卸载 wireguard-tools 系统包
-func removePackages() bool {
-	sysInfo, err := system.Detect()
-	if err != nil {
+func removePackages(sysInfo *system.SysInfo) bool {
+	if sysInfo == nil {
 		return false
 	}
 	var cmds [][]string
@@ -127,9 +127,8 @@ func removePackages() bool {
 }
 
 // removeZeroTrustPackage 卸载 cloudflare-warp (warp-cli) 包
-func removeZeroTrustPackage() bool {
-	sysInfo, err := system.Detect()
-	if err != nil {
+func removeZeroTrustPackage(sysInfo *system.SysInfo) bool {
+	if sysInfo == nil {
 		return false
 	}
 	var cmd *exec.Cmd
@@ -154,38 +153,83 @@ func removeZeroTrustPackage() bool {
 
 // cleanupNetworkRules 强制清除所有 WarpGo 创建的网络规则
 func cleanupNetworkRules() {
-	// 1. 删除 fwmark 51820 策略路由规则（重试多次确保清干净）
-	for i := 0; i < 5; i++ {
+	// 1. 删除所有 fwmark 51820 策略路由规则（重试多次确保清干净）
+	// 包括 IPv4 和 IPv6 的各种规则
+	for i := 0; i < 10; i++ {
 		out, _ := exec.Command("ip", "rule", "show").Output()
-		if !strings.Contains(string(out), "51820") {
+		if !strings.Contains(string(out), "51820") && !strings.Contains(string(out), "warp") {
 			break
 		}
+		// 删除各种可能的规则
 		exec.Command("ip", "rule", "del", "fwmark", "51820", "table", "51820").Run()
+		exec.Command("ip", "rule", "del", "not", "fwmark", "51820", "table", "51820").Run()
+		exec.Command("ip", "rule", "del", "table", "main", "suppress_prefixlength", "0").Run()
 	}
 
-	// 2. 清空路由表 51820
+	// 1b. 清理 IPv6 规则
+	for i := 0; i < 10; i++ {
+		out, _ := exec.Command("ip", "-6", "rule", "show").Output()
+		if !strings.Contains(string(out), "51820") && !strings.Contains(string(out), "warp") {
+			break
+		}
+		exec.Command("ip", "-6", "rule", "del", "fwmark", "51820", "table", "51820").Run()
+		exec.Command("ip", "-6", "rule", "del", "not", "fwmark", "51820", "table", "51820").Run()
+		exec.Command("ip", "-6", "rule", "del", "table", "main", "suppress_prefixlength", "0").Run()
+	}
+
+	// 1c. 清理 warp 添加的 from/to 规则（仅删除与 warp 相关的规则）
+	// 不删除系统原有的路由规则
+	out, _ := exec.Command("ip", "rule", "show").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		// 只删除明确由 warp 添加的规则（包含 "warp" 关键字）
+		if strings.Contains(line, "warp") && !strings.Contains(line, "main") {
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				priority := fields[0]
+				exec.Command("ip", "rule", "del", "priority", priority).Run()
+			}
+		}
+	}
+
+	// 2. 清空路由表 51820（IPv4 和 IPv6）
 	exec.Command("ip", "route", "flush", "table", "51820").Run()
+	exec.Command("ip", "-6", "route", "flush", "table", "51820").Run()
 
 	// 3. 删除 warp 接口（如果还残留）
 	exec.Command("ip", "link", "delete", "dev", config.WarpIfName).Run()
 
-	// 4. 清理 iptables 规则
+	// 4. 清理 iptables 规则和链
 	if _, err := exec.LookPath("iptables"); err == nil {
+		// 删除 mangle 表规则
 		rules := [][]string{
 			{"-t", "mangle", "-D", "PREROUTING", "-d", "162.159.0.0/16", "-j", "MARK", "--set-mark", "51820"},
+			{"-t", "mangle", "-D", "OUTPUT", "-p", "tcp", "-m", "multiport", "--sports", "22", "-j", "MARK", "--set-mark", "51820"},
 		}
 		for _, r := range rules {
 			exec.Command("iptables", r...).Run()
 		}
+		// 清理 nat 表的 WARP_PROXY 链（Zero Trust 透明代理）
+		exec.Command("iptables", "-t", "nat", "-F", "WARP_PROXY").Run()
+		exec.Command("iptables", "-t", "nat", "-X", "WARP_PROXY").Run()
+		// 清理 OUTPUT 链的规则
+		exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "WARP_PROXY").Run()
 	}
 	if _, err := exec.LookPath("ip6tables"); err == nil {
 		exec.Command("ip6tables", "-t", "mangle", "-D", "PREROUTING",
 			"-d", "2606:4700::/32", "-j", "MARK", "--set-mark", "51820").Run()
+		// 清理 IPv6 的 nat 表
+		exec.Command("ip6tables", "-t", "nat", "-F", "WARP_PROXY").Run()
+		exec.Command("ip6tables", "-t", "nat", "-X", "WARP_PROXY").Run()
 	}
 
-	// 5. 清理 nftables warpgo 表（Debian 12+/Ubuntu 22+ 现代系统）
+	// 5. 清理 nftables warpgo 表（IPv4 和 IPv6）
 	if _, err := exec.LookPath("nft"); err == nil {
 		exec.Command("nft", "delete", "table", "ip", "warpgo").Run()
+		exec.Command("nft", "delete", "table", "ip6", "warpgo").Run()
+		// 不要删除整个 nat 表，只删除 warpgo 相关的链
+		// 如果有 warpgo 链在 nat 表中，删除它
+		exec.Command("nft", "delete", "chain", "ip", "nat", "warpgo").Run()
+		exec.Command("nft", "delete", "chain", "ip6", "nat", "warpgo").Run()
 	}
 
 	// 6. 清理 /etc/iproute2/rt_tables 中 warp 相关条目
@@ -215,8 +259,8 @@ func cleanupNetworkRules() {
 		os.WriteFile("/etc/gai.conf", []byte(content), 0644)
 	}
 
-	// 10. 重启 DNS 服务确保解析正常
-	exec.Command("systemctl", "restart", "systemd-resolved").Run()
+	// 10. 不重置 sysctl 参数，避免影响系统网络
+	// 11. 不重启网络服务，避免中断当前连接
 	exec.Command("systemctl", "daemon-reload").Run()
 }
 
@@ -257,10 +301,15 @@ func removeAllFiles() {
 	serviceFiles := []string{
 		"/lib/systemd/system/redsocks.service",
 		"/etc/redsocks.conf",
+		"/etc/systemd/system/wg-quick@warp.service",
 	}
 	for _, s := range serviceFiles {
 		os.Remove(s)
 	}
+
+	// warp-cli 相关文件
+	os.RemoveAll("/var/lib/cloudflare-warp")
+	os.RemoveAll("/etc/cloudflare-warp")
 
 	// WarpGo 相关的运行时缓存文件
 	tmpFiles := []string{
@@ -273,8 +322,17 @@ func removeAllFiles() {
 	}
 
 	// 移除 warp-cli 的本地数据目录
-	localWarpDir := os.Getenv("HOME") + "/.local/share/warp"
-	os.RemoveAll(localWarpDir)
+	homeDir := os.Getenv("HOME")
+	if homeDir != "" {
+		localWarpDirs := []string{
+			homeDir + "/.local/share/warp",
+			homeDir + "/.config/warp",
+			homeDir + "/.cache/warp",
+		}
+		for _, d := range localWarpDirs {
+			os.RemoveAll(d)
+		}
+	}
 
 	// crontab 清理（移除任何 warp/tun.sh 相关条目）
 	if data, err := os.ReadFile("/etc/crontab"); err == nil {

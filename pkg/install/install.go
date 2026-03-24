@@ -207,9 +207,11 @@ func detectMTU(endpoint string) int {
 
 // findFreePort 从给定端口开始找一个空闲端口
 func findFreePort(startPort int) int {
-	for port := startPort; port <= 65535; port++ {
-		addr := fmt.Sprintf(":%d", port)
-		l, err := net.Listen("tcp", addr)
+	// 使用 listen 然后关闭的方式检查端口可用性
+	// 限制检查范围避免遍历过多端口
+	const maxAttempts = 100
+	for port := startPort; port <= startPort+maxAttempts && port <= 65535; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
 			l.Close()
 			return port

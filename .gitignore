@@ -1,0 +1,19 @@
+# 编译产物
+warpgo_linux_amd64
+warpgo_*.tar.gz
+
+# 备份文件
+*副本*
+*.bak
+*.tmp
+
+# IDE 文件
+.idea/
+.vscode/
+
+# Go 编译缓存
+vendor/
+
+# 系统文件
+.DS_Store
+Thumbs.db

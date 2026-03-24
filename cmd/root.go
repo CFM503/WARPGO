@@ -85,33 +85,82 @@ func showMainMenu(sysInfo *system.SysInfo) {
 	status := network.GetNetworkStatus()
 
 	for {
-		ui.PrintBanner(config.Version, sysInfo.String(), status.String())
+		// 获取当前连接状态
+		wgInstalled := wireguard.IsInstalled()
+		wgRunning := wireguard.IsRunning()
+		ztInstalled := zerotrust.IsWarpCLIInstalled()
+		ztStatus, _ := zerotrust.GetStatus()
+
+		// 确定连接类型和信息
+		connectionType := ""
+		connectionInfo := ""
+		isConnected := false
+
+		if ztInstalled && ztStatus.Connected {
+			// Zero Trust 已连接
+			connectionType = "Zero Trust"
+			isConnected = true
+			// 获取组织信息
+			if ztCfg, err := zerotrust.LoadZeroTrustConfig(); err == nil && ztCfg.OrgName != "" {
+				connectionInfo = fmt.Sprintf("组织: %s", ztCfg.OrgName)
+			}
+		} else if wgInstalled && wgRunning {
+			// WARP WireGuard 正在运行
+			connectionType = "WARP WireGuard"
+			isConnected = true
+			mode := "全局模式"
+			if !wireguard.IsGlobalMode() {
+				mode = "非全局模式"
+			}
+			connectionInfo = mode
+		} else if wgInstalled {
+			// WARP 已安装但未运行
+			connectionType = "WARP WireGuard (已停止)"
+		} else if ztInstalled {
+			// Zero Trust 已安装但未连接
+			connectionType = "Zero Trust (已断开)"
+		} else {
+			// 未安装任何组件
+			connectionType = "未安装"
+		}
+
+		// 显示状态面板
+		ui.PrintStatusPanel(
+			config.Version,
+			sysInfo.String(),
+			connectionType,
+			connectionInfo,
+			status.String(),
+		)
 
 		// 动态菜单
 		var items []ui.MenuItem
 
-		wgInstalled := wireguard.IsInstalled()
-		ztInstalled := zerotrust.IsWarpCLIInstalled()
-
-		if ztInstalled {
-			ztStatus, _ := zerotrust.GetStatus()
-			ui.PrintKV("Zero Trust", fmt.Sprintf("已安装 (状态: %v, 模式: %s)", ztStatus.Connected, ztStatus.Mode))
+		// 显示详细状态
+		if isConnected {
+			if ztInstalled && ztStatus.Connected {
+				ui.PrintStatusLine("Zero Trust", "已连接", true)
+				if ztStatus.Mode != "" {
+					ui.PrintInfoLine("运行模式", ztStatus.Mode)
+				}
+			} else if wgInstalled && wgRunning {
+				mode := "全局"
+				if !wireguard.IsGlobalMode() {
+					mode = "非全局"
+				}
+				stack := wireguard.GetCurrentStack()
+				stackStr := "双栈"
+				if stack == config.StackIPv4 {
+					stackStr = "IPv4"
+				} else if stack == config.StackIPv6 {
+					stackStr = "IPv6"
+				}
+				ui.PrintStatusLine("WARP", fmt.Sprintf("%s %s", mode, stackStr), true)
+			}
 		} else if wgInstalled {
-			ui.PrintStatus("WARP 接口", wireguard.IsRunning())
-			mode := "全局"
-			if !wireguard.IsGlobalMode() {
-				mode = "非全局"
-			}
-			ui.PrintKV("WARP 模式", mode)
-
-			stack := wireguard.GetCurrentStack()
-			stackStr := "双栈"
-			if stack == config.StackIPv4 {
-				stackStr = "IPv4"
-			} else if stack == config.StackIPv6 {
-				stackStr = "IPv6"
-			}
-			ui.PrintKV("WARP 协议栈", stackStr)
+			ui.PrintStatusLine("WARP", "已停止", false)
+		} else if ztInstalled {
+			ui.PrintStatusLine("Zero Trust", "已断开", false)
 		}
 
 		if !wgInstalled && !ztInstalled {
@@ -135,8 +184,11 @@ func showMainMenu(sysInfo *system.SysInfo) {
 			items = append(items, ui.MenuItem{Key: "u", Label: "完全卸载", Description: "清理所有已安装的组件和配置"})
 		}
 
-		items = append(items, ui.MenuItem{Key: "r", Label: "检查更新", Description: "升级 WarpGo 到最新版本"})
-		items = append(items, ui.MenuItem{Key: "0", Label: "退出程序"})
+		items = append(items,
+			ui.MenuItem{Key: "i", Label: "刷新状态", Description: "重新获取网络状态和 IP 信息"},
+			ui.MenuItem{Key: "h", Label: "帮助", Description: "显示命令行参数和使用说明"},
+			ui.MenuItem{Key: "0", Label: "退出程序"},
+		)
 
 		choice := ui.ShowMenu("请选择你要执行的操作", items)
 
@@ -157,30 +209,8 @@ func showMainMenu(sysInfo *system.SysInfo) {
 			}
 		case "2":
 			if !wgInstalled && !ztInstalled {
-				// Zero Trust（Service Token 方式）
-				ui.Info("Zero Trust 接入需要 Service Token（从 Cloudflare 控制台获取）")
-				ui.Hint("获取路径: one.dash.cloudflare.com → Settings → WARP Client → Device enrollment")
-				ui.Blank()
-				org := ui.ReadInput("请输入 Zero Trust 组织名称 (Team Name): ")
-				if org == "" {
-					continue
-				}
-				clientID := ui.ReadInput("请输入 Service Token 的 Client ID: ")
-				if clientID == "" {
-					continue
-				}
-				clientSecret := ui.ReadInput("请输入 Service Token 的 Client Secret: ")
-				if clientSecret == "" {
-					continue
-				}
-				opts := &install.InstallOptions{
-					Mode:                  config.ModeZeroTrust,
-					ZeroTrustOrg:          org,
-					ZeroTrustEnrollMode:   config.EnrollServiceToken,
-					ZeroTrustClientID:     clientID,
-					ZeroTrustClientSecret: clientSecret,
-				}
-				install.Install(sysInfo, opts)
+				// Zero Trust 配置菜单
+				installZeroTrustMenu(sysInfo)
 			} else if wgInstalled {
 				global := wireguard.IsGlobalMode()
 				wireguard.SwitchGlobalMode(!global)
@@ -189,12 +219,17 @@ func showMainMenu(sysInfo *system.SysInfo) {
 			if wgInstalled {
 				stackMenu()
 			}
+		case "i", "I":
+			// 刷新网络状态
+			ui.Info("正在刷新网络状态...")
+			status = network.GetNetworkStatus()
+			ui.Info("✓ 网络状态已更新")
+		case "h", "H":
+			showHelp()
 		case "u", "U":
 			if ui.Confirm("确定要完全卸载所有 WARP 相关组件吗？") {
 				install.Uninstall()
 			}
-		case "r", "R":
-			install.Update()
 		case "0":
 			ui.Info("感谢使用 WarpGo！再见！")
 			os.Exit(0)
@@ -263,4 +298,76 @@ func stackMenu() {
 	case "3":
 		wireguard.SwitchStack(config.StackDual)
 	}
+}
+
+func installZeroTrustMenu(sysInfo *system.SysInfo) {
+	ui.Blank()
+	ui.Hint("【Zero Trust 配置说明】")
+	ui.Hint("  Zero Trust 需要 Cloudflare 组织（Team）和 Service Token")
+	ui.Hint("  获取路径: one.dash.cloudflare.com → Settings → WARP Client → Device enrollment")
+	ui.Hint("  创建 Service Token: Access controls → Service credentials → Service Tokens")
+	ui.Blank()
+
+	items := []ui.MenuItem{
+		{Key: "1", Label: "开始配置", Description: "输入组织名称和 Service Token"},
+		{Key: "0", Label: "返回上级菜单"},
+	}
+
+	choice := ui.ShowMenu("Zero Trust 配置", items)
+	switch choice {
+	case "1":
+		org := ui.ReadInput("请输入 Zero Trust 组织名称 (Team Name): ")
+		if org == "" {
+			ui.Warning("组织名称不能为空")
+			return
+		}
+		clientID := ui.ReadInput("请输入 Service Token 的 Client ID: ")
+		if clientID == "" {
+			ui.Warning("Client ID 不能为空")
+			return
+		}
+		clientSecret := ui.ReadInput("请输入 Service Token 的 Client Secret: ")
+		if clientSecret == "" {
+			ui.Warning("Client Secret 不能为空")
+			return
+		}
+		opts := &install.InstallOptions{
+			Mode:                  config.ModeZeroTrust,
+			ZeroTrustOrg:          org,
+			ZeroTrustEnrollMode:   config.EnrollServiceToken,
+			ZeroTrustClientID:     clientID,
+			ZeroTrustClientSecret: clientSecret,
+		}
+		install.Install(sysInfo, opts)
+	case "0":
+		return
+	default:
+		ui.Warning("无效选项，返回主菜单")
+		return
+	}
+}
+
+func showHelp() {
+	ui.Blank()
+	ui.Header("WarpGo 命令行参数")
+	ui.Separator()
+	ui.Hint("  -v    显示版本信息")
+	ui.Hint("  -4    安装 IPv4 WARP（WireGuard）")
+	ui.Hint("  -6    安装 IPv6 WARP（WireGuard）")
+	ui.Hint("  -d    安装双栈 WARP（WireGuard）")
+	ui.Hint("  -z    配置 Zero Trust（需要 Service Token）")
+	ui.Hint("  -u    完全卸载所有组件")
+	ui.Blank()
+	ui.Header("使用示例")
+	ui.Separator()
+	ui.Hint("  ./warpgo -4          # 安装 IPv4 WARP")
+	ui.Hint("  ./warpgo -d          # 安装双栈 WARP")
+	ui.Hint("  ./warpgo -z          # 配置 Zero Trust")
+	ui.Hint("  ./warpgo -u          # 完全卸载")
+	ui.Blank()
+	ui.Header("交互模式")
+	ui.Separator()
+	ui.Hint("  直接运行 ./warpgo 进入交互菜单")
+	ui.Hint("  支持 WARP 安装/管理、Zero Trust 配置、卸载等功能")
+	ui.Blank()
 }

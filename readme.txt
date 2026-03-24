@@ -10,8 +10,8 @@ WarpGo — Cloudflare Zero Trust / WARP 使用说明（备忘）
 
 warpgo 是在 Linux VPS 上安装、管理 Cloudflare WARP 的工具，主要有两条路径：
 
-  模式 A：WireGuard / WireProxy（命令行 -4 / -6 / -d / -p）
-    - 自建 warp 接口或 SOCKS5
+  模式 A：WireGuard（命令行 -4 / -6 / -d）
+    - 自建 warp 接口
     - 不依赖 Zero Trust 组织，偏「个人 WARP」式用法
 
   模式 B：Zero Trust（命令行 -z 或交互菜单里选 Zero Trust）
@@ -91,7 +91,6 @@ MDM 参数说明（官方）：
   -4    安装 IPv4 WARP（WireGuard 路径）
   -6    安装 IPv6 WARP
   -d    双栈
-  -p    WireProxy SOCKS5
   -z    配置 Zero Trust（cloudflare-warp + Service Token）
   -u    卸载
 
