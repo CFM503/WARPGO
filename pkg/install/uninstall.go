@@ -76,9 +76,10 @@ func stopAllServices() {
 		{"systemctl", "disable", "wg-quick@warp"},
 		// 停止 Zero Trust / warp-cli 守护进程
 		{"warp-cli", "--accept-tos", "disconnect"},
-		{"warp-cli", "--accept-tos", "registration", "delete"},
-		{"systemctl", "disable", "--now", "warp-svc"},
-		// 不重启 systemd-resolved，避免影响 DNS
+		// 不删除注册，只断开连接
+		// {"warp-cli", "--accept-tos", "registration", "delete"},
+		{"systemctl", "stop", "warp-svc"},
+		{"systemctl", "disable", "warp-svc"},
 	}
 	for _, args := range cmds {
 		exec.Command(args[0], args[1:]...).Run() // 忽略错误，能停则停
@@ -101,7 +102,8 @@ func removePackages(sysInfo *system.SysInfo) bool {
 	switch sysInfo.PkgManager {
 	case system.PkgAPT:
 		cmds = [][]string{
-			{"apt-get", "remove", "-y", "--purge", "wireguard-tools", "openresolv", "resolvconf"},
+			// 只卸载 wireguard-tools，不卸载 openresolv/resolvconf（它们可能是系统必需的）
+			{"apt-get", "remove", "-y", "--purge", "wireguard-tools"},
 			{"apt-get", "autoremove", "-y"},
 		}
 	case system.PkgYUM, system.PkgDNF:
@@ -249,8 +251,17 @@ func cleanupNetworkRules() {
 		exec.Command("mv", "-f", "/etc/resolv.conf.origin", "/etc/resolv.conf").Run()
 	}
 
-	// 8. 清理 resolvconf 中 warp 的 DNS 条目
-	exec.Command("resolvconf", "-d", config.WarpIfName, "-f").Run()
+	// 7b. 确保 resolv.conf 存在且有效
+	if data, err := os.ReadFile("/etc/resolv.conf"); err != nil || len(data) == 0 {
+		// 如果 resolv.conf 为空或不存在，创建一个默认的
+		defaultDNS := "nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\n"
+		os.WriteFile("/etc/resolv.conf", []byte(defaultDNS), 0644)
+	}
+
+	// 8. 清理 resolvconf 中 warp 的 DNS 条目（如果命令存在）
+	if _, err := exec.LookPath("resolvconf"); err == nil {
+		exec.Command("resolvconf", "-d", config.WarpIfName, "-f").Run()
+	}
 
 	// 9. 清理 gai.conf 中 warp 添加的 IPv6 优先规则（如有）
 	if data, err := os.ReadFile("/etc/gai.conf"); err == nil {
